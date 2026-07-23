@@ -72,17 +72,16 @@ if st.button("Generate SQL Query"):
             st.session_state["generated_sql"] = sql_query
             st.session_state["editable_sql"] = sql_query
             st.session_state.pop("query_results", None)
-            st.session_state.pop("optimization_tips", None)
     except requests.RequestException as exc:
         st.error(f"Could not reach FastAPI: {exc}")
 
 if "generated_sql" in st.session_state:
     st.subheader("Generated SQL")
     edited_sql = st.text_area(
-        "Edit SQL before execution",
+        "SQL query",
         key="editable_sql",
         height=180,
-        help="You can correct table or column names before executing the query.",
+        label_visibility="collapsed",
     )
 
     if st.button("Execute SQL"):
@@ -97,10 +96,6 @@ if "generated_sql" in st.session_state:
                 st.error(response_data.get("detail", "Error executing SQL query."))
             else:
                 st.session_state["query_results"] = response_data.get("results", [])
-                st.session_state["optimization_tips"] = response_data.get(
-                    "optimization_tips",
-                    "No optimization tips available.",
-                )
         except requests.RequestException as exc:
             st.error(f"Could not reach FastAPI: {exc}")
 
@@ -111,6 +106,3 @@ if "query_results" in st.session_state:
         st.dataframe(pd.DataFrame(results), use_container_width=True)
     else:
         st.info("The query executed successfully but did not return any rows.")
-
-    st.subheader("Optimization Tips")
-    st.write(st.session_state.get("optimization_tips", "No optimization tips available."))

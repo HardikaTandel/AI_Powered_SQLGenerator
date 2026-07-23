@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from urllib.error import HTTPError, URLError
@@ -19,6 +20,8 @@ MODEL_NAME = os.getenv("MODEL_NAME", "qwen3:8b")
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "256"))
+
+logger = logging.getLogger(__name__)
 
 
 class SQLGenerationError(Exception):
@@ -69,6 +72,28 @@ def clean_sql_output(response_text):
     return clean_query.strip()
 
 
+def extract_sql_statement(response_text):
+    """Return a standalone SQL statement from a model response, if present.
+
+    Some model/runtime combinations emit reasoning before the requested SQL.
+    Looking for a statement at the beginning of a line avoids treating prose
+    such as "select the name column" as SQL.
+    """
+    clean_query = clean_sql_output(response_text)
+    is_valid, _ = validate_sql_query(clean_query)
+    if is_valid:
+        return clean_query
+
+    statement_match = re.search(
+        r"(?ims)^\s*(SELECT|INSERT|UPDATE|DELETE)\b.*?;",
+        clean_query,
+    )
+    if statement_match:
+        return statement_match.group(0).strip()
+
+    return clean_query
+
+
 def validate_sql_query(sql_query):
     """Validate that the result is one executable SQL statement."""
     try:
@@ -105,29 +130,47 @@ def generate_sql_query(natural_language_query):
     )
 
     dialect = get_sql_dialect().upper()
+    dialect_rules = ""
+    if dialect == "SQLITE":
+        dialect_rules = (
+            "- SQLite syntax: use LIMIT <number> after ORDER BY to limit rows.\n"
+            "- Never use TOP, which is not valid SQLite syntax.\n"
+        )
+
     prompt = f"""You are an expert {dialect} SQL generator.
 
 Database Schema:
 {schema_text}
 
 Rules:
-- Return ONLY executable SQL.
-- No explanation.
-- No markdown.
-- No ```sql blocks.
+- Return a JSON object with exactly one key: "sql".
+- The "sql" value must be one executable SQL statement.
+- No explanation or markdown.
 - Use only tables present in the schema.
 - Generate optimized SQL.
 - Use JOIN instead of subqueries where appropriate.
+- Use SUM, AVG, COUNT, GROUP BY, or other aggregation only when the user explicitly asks for an aggregate, total, average, count, or grouping.
+- For "top", "highest", or "largest" requests without an explicit aggregate, return individual rows ordered by the requested column.
+
+Dialect-specific rules:
+{dialect_rules}
 
 User Question:
 {natural_language_query.strip()}
+/no_think
 
 SQL:"""
 
     payload = json.dumps(
         {
         "model": MODEL_NAME,
-            "prompt": prompt,
+            "format": {
+                "type": "object",
+                "properties": {"sql": {"type": "string"}},
+                "required": ["sql"],
+                "additionalProperties": False,
+            },
+            "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "think": False,
             "keep_alive": OLLAMA_KEEP_ALIVE,
@@ -139,7 +182,7 @@ SQL:"""
     ).encode("utf-8")
 
     request = Request(
-        f"{OLLAMA_BASE_URL}/api/generate",
+        f"{OLLAMA_BASE_URL}/api/chat",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -168,13 +211,33 @@ SQL:"""
     except json.JSONDecodeError as exc:
         raise SQLGenerationError("Ollama returned an invalid response.") from exc
 
-    clean_query = clean_sql_output(body.get("response", ""))
+    message = body.get("message", {})
+    raw_response = message.get("content", "")
+    logger.warning(
+        "Ollama chat completed: model=%s done_reason=%s thinking=%r raw_response=%r",
+        body.get("model", MODEL_NAME),
+        body.get("done_reason"),
+        message.get("thinking", ""),
+        raw_response,
+    )
+
+    try:
+        structured_output = json.loads(raw_response)
+        sql_value = structured_output.get("sql", "") if isinstance(structured_output, dict) else ""
+        clean_query = clean_sql_output(sql_value)
+    except json.JSONDecodeError:
+        clean_query = extract_sql_statement(raw_response)
 
     if not clean_query:
         raise InvalidGeneratedSQLError("Ollama returned an empty SQL response.")
 
     is_valid, error_message = validate_sql_query(clean_query)
     if not is_valid:
+        if body.get("done_reason") == "length":
+            raise InvalidGeneratedSQLError(
+                "Ollama reached its output-token limit before returning valid SQL. "
+                "Increase OLLAMA_MAX_TOKENS or use a non-thinking SQL model."
+            )
         raise InvalidGeneratedSQLError(
             f"Ollama generated invalid SQL: {error_message}"
         )

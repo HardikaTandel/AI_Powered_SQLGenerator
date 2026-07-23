@@ -61,7 +61,7 @@ def _new_database_path(source_path):
     return DATABASE_DIR / f"{source_path.stem}_{uuid.uuid4().hex}.db"
 
 
-def csv_to_sqlite(csv_path):
+def csv_to_sqlite(csv_path, table_name=None):
     """Convert a CSV file to a new SQLite database and return its path."""
     try:
         dataframe = pd.read_csv(csv_path, on_bad_lines="error")
@@ -72,7 +72,7 @@ def csv_to_sqlite(csv_path):
         raise DatasetError("The CSV file does not contain any columns.")
 
     database_path = _new_database_path(Path(csv_path))
-    table_name = _safe_table_name(Path(csv_path).stem)
+    table_name = _safe_table_name(table_name or Path(csv_path).stem)
     try:
         with sqlite3.connect(database_path) as connection:
             dataframe.to_sql(table_name, connection, index=False, if_exists="replace")
@@ -166,7 +166,7 @@ def save_uploaded_file(upload_file):
     database_path = None
     try:
         if file_type == "csv":
-            database_path = csv_to_sqlite(upload_path)
+            database_path = csv_to_sqlite(upload_path, Path(upload_file.filename).stem)
         elif file_type == "excel":
             database_path = excel_to_sqlite(upload_path)
         else:
