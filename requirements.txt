@@ -1,29 +1,15 @@
-langchain
-llama-index
-crewai
-chromadb
-
-transformers
-sentence-transformers
-
 fastapi
 uvicorn
 pydantic
 python-multipart
 
 sqlalchemy
-psycopg2-binary
-pyodbc
-mysql-connector-python
 pymysql
-snowflake-connector-python
-
-tqdm
 python-dotenv
-loguru
 
 pytest
 sqlparse
 streamlit
 pandas
 openpyxl
+requests

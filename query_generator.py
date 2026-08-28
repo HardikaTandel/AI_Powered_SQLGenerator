@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from functools import lru_cache
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -10,7 +11,7 @@ from dotenv import load_dotenv
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
-from database import get_engine, get_schema, get_sql_dialect
+from database import get_confirmed_relationships, get_engine, get_schema, get_sql_dialect
 
 load_dotenv()
 
@@ -20,6 +21,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "qwen3:8b")
 OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "600"))
 OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 OLLAMA_MAX_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "256"))
+MAX_RESULT_ROWS = int(os.getenv("MAX_RESULT_ROWS", "200"))
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +87,7 @@ def extract_sql_statement(response_text):
         return clean_query
 
     statement_match = re.search(
-        r"(?ims)^\s*(SELECT|INSERT|UPDATE|DELETE)\b.*?;",
+        r"(?ims)^\s*(SELECT|WITH)\b.*?;",
         clean_query,
     )
     if statement_match:
@@ -95,7 +97,7 @@ def extract_sql_statement(response_text):
 
 
 def validate_sql_query(sql_query):
-    """Validate that the result is one executable SQL statement."""
+    """Validate that the result is one read-only SQL statement."""
     try:
         parsed = sqlparse.parse(sql_query)
 
@@ -103,15 +105,20 @@ def validate_sql_query(sql_query):
             return False, "Invalid SQL syntax."
 
         statement_type = parsed[0].get_type()
-        if statement_type not in {"SELECT", "INSERT", "UPDATE", "DELETE"}:
+        if statement_type != "SELECT":
             return (
                 False,
-                "Only executable SELECT, INSERT, UPDATE, and DELETE statements are allowed.",
+                "Only one read-only SELECT statement is allowed.",
             )
 
         return True, None
     except Exception as exc:
         return False, str(exc)
+
+
+def _schema_cache_key(schema):
+    """Create a stable cache key that changes whenever the active schema changes."""
+    return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
 def generate_sql_query(natural_language_query):
@@ -124,12 +131,22 @@ def generate_sql_query(natural_language_query):
     except Exception as exc:
         raise SQLGenerationError(f"Could not read the database schema: {exc}") from exc
 
+    schema_key = _schema_cache_key(schema)
+    dialect = get_sql_dialect().upper()
+    relationships_key = json.dumps(get_confirmed_relationships(), sort_keys=True, separators=(",", ":"))
+    return _generate_sql_query_cached(natural_language_query.strip(), schema_key, dialect, relationships_key)
+
+
+@lru_cache(maxsize=128)
+def _generate_sql_query_cached(natural_language_query, schema_key, dialect, relationships_key):
+    """Generate SQL and reuse answers for identical questions and schemas."""
+    schema = json.loads(schema_key)
+    relationships = json.loads(relationships_key)
     schema_text = "\n".join(
         f"{table}: {', '.join(columns)}"
         for table, columns in schema.items()
     )
 
-    dialect = get_sql_dialect().upper()
     dialect_rules = ""
     if dialect == "SQLITE":
         dialect_rules = (
@@ -137,17 +154,30 @@ def generate_sql_query(natural_language_query):
             "- Never use TOP, which is not valid SQLite syntax.\n"
         )
 
+    relationship_text = "None confirmed. Do not invent relationships between tables."
+    if relationships:
+        relationship_text = "\n".join(
+            "- {source_table}.{source_column} REFERENCES "
+            "{target_table}.{target_column} ({relationship})".format(**relationship)
+            for relationship in relationships
+        )
+
     prompt = f"""You are an expert {dialect} SQL generator.
 
 Database Schema:
 {schema_text}
 
+Confirmed Relationships:
+{relationship_text}
+
 Rules:
 - Return a JSON object with exactly one key: "sql".
-- The "sql" value must be one executable SQL statement.
+- The "sql" value must be one read-only SELECT statement.
 - No explanation or markdown.
 - Use only tables present in the schema.
+- For multi-table queries, join tables only through the confirmed relationships above.
 - Generate optimized SQL.
+- Unless an aggregate returns a single value, use LIMIT {MAX_RESULT_ROWS} or fewer.
 - Use JOIN instead of subqueries where appropriate.
 - Use SUM, AVG, COUNT, GROUP BY, or other aggregation only when the user explicitly asks for an aggregate, total, average, count, or grouping.
 - For "top", "highest", or "largest" requests without an explicit aggregate, return individual rows ordered by the requested column.
@@ -156,7 +186,7 @@ Dialect-specific rules:
 {dialect_rules}
 
 User Question:
-{natural_language_query.strip()}
+{natural_language_query}
 /no_think
 
 SQL:"""
@@ -213,12 +243,10 @@ SQL:"""
 
     message = body.get("message", {})
     raw_response = message.get("content", "")
-    logger.warning(
-        "Ollama chat completed: model=%s done_reason=%s thinking=%r raw_response=%r",
+    logger.info(
+        "Ollama chat completed: model=%s done_reason=%s",
         body.get("model", MODEL_NAME),
         body.get("done_reason"),
-        message.get("thinking", ""),
-        raw_response,
     )
 
     try:
@@ -245,25 +273,24 @@ SQL:"""
     return clean_query
 
 
-def suggest_index(sql_query):
-    """Suggest indexes for the executed SQL query."""
+def analyze_query(sql_query):
+    """Return an optional execution plan and a conservative index suggestion."""
     try:
         with get_engine().connect() as connection:
             explain_query = f"EXPLAIN {sql_query}"
             result = connection.execute(text(explain_query))
             execution_plan = result.fetchall()
 
-        print("\nQuery Execution Plan:")
-        for row in execution_plan:
-            print(row)
-
-        return "Consider adding an index on frequently used WHERE conditions."
+        return {
+            "execution_plan": [dict(row._mapping) for row in execution_plan],
+            "optimization_tips": "Consider indexes on columns frequently used in WHERE, JOIN, and ORDER BY clauses.",
+        }
     except Exception as exc:
-        return f"Could not generate execution plan: {exc}"
+        return {"execution_plan": None, "optimization_tips": f"Could not generate execution plan: {exc}"}
 
 
-def execute_query(sql_query):
-    """Execute a validated SQL query."""
+def execute_query(sql_query, analyze=False):
+    """Execute one validated SELECT query and return at most MAX_RESULT_ROWS rows."""
     is_valid, error_msg = validate_sql_query(sql_query)
     if not is_valid:
         print(f"SQL Validation Error: {error_msg}")
@@ -272,12 +299,13 @@ def execute_query(sql_query):
     try:
         with get_engine().connect() as connection:
             result = connection.execute(text(sql_query))
-            fetched_results = result.fetchall() if result.returns_rows else []
+            fetched_results = result.fetchmany(MAX_RESULT_ROWS) if result.returns_rows else []
 
-        index_suggestion = suggest_index(sql_query)
         results = [dict(row._mapping) for row in fetched_results]
-
-        return {"results": results, "optimization_tips": index_suggestion}
+        response = {"results": results, "row_limit": MAX_RESULT_ROWS}
+        if analyze:
+            response.update(analyze_query(sql_query))
+        return response
     except SQLAlchemyError as exc:
         print(f"SQL Execution Error: {exc}")
         return None
